@@ -1,8 +1,11 @@
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+from statsmodels.stats.stattools import durbin_watson
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
 import os
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
@@ -15,32 +18,16 @@ class ModelConfig:
     """Configuration for model variables and targets"""
     # Model predictor columns
     sales_v1_cols: List[str]  # Lag-only model
-    sales_v2_cols: List[str]  # Full model with current CP/DA
-    cp_cols: List[str]
-    da_cols: List[str]
-    si_cols: List[str]
     
     # Target columns
     sales_target: str = 'Sales'
-    cp_target: str = 'CP'
-    da_target: str = 'DA'
-    si_target: str = 'SeasIndx'
 
 @dataclass 
 class ForecastResults:
     """Container for storing forecast results"""
     # Predictions and actuals
     sales_pred_v1: List[float]
-    sales_pred_v2: List[float]
-    sales_pred_v2_official: List[float]
     sales_true: List[float]
-    
-    cp_pred: List[float]
-    da_pred: List[float]
-    si_pred: List[float]
-    cp_true: List[float]
-    da_true: List[float]
-    si_true: List[float]
     
     # R² values
     r2_values: Dict[str, List[float]]
@@ -51,8 +38,8 @@ class ForecastResults:
     jan88_predictions: Dict[str, List[float]]
     
     # Cumulative performance metrics
-    cumulative_rmse: Dict[str, List[float]]
-    cumulative_mape: Dict[str, List[float]]
+    cumulative_rmse: List[float]
+    cumulative_mape: List[float]
     
     # Model coefficient statistics (for last iteration)
     final_model_stats: Dict[str, Dict]
@@ -87,25 +74,9 @@ class HarmonFoodsForecaster:
             rows_to_exclude = [12, 24, 38, 40, 41, 44]  # Default exclusion list
         df = self.exclude_rows(df, rows_to_exclude)
         
-        # Add artificial 'Exceptional Event' column
-        df['Exceptional Event'] = 0
-        exceptional_events = [12, 38, 40, 41, 44]
-        for idx in exceptional_events:
-            if idx < len(df):  # Make sure the index exists after exclusions
-                df.loc[idx, 'Exceptional Event'] = 1
-        
         # Convert to float
-        cols_to_float = ['Sales', 'CP', 'CP(t-1)', 'CP(t-2)', 'DA', 'DA(t-1)', 'DA(t-2)', 'SeasIndx', 'Exceptional Event']
+        cols_to_float = ['Sales', 'CP', 'CP(t-1)', 'CP(t-2)', 'DA', 'DA(t-1)', 'DA(t-2)', 'SeasIndx']
         df[cols_to_float] = df[cols_to_float].astype(float)
-        
-        # Apply log transformations
-        log_cols = ['DA', 'DA(t-1)', 'DA(t-2)', 'CP', 'CP(t-1)', 'CP(t-2)']
-        for col in log_cols:
-            df[col] = np.log1p(df[col])
-        
-        # Create lag features
-        for lag in [12]:
-            df[f"lag_{lag}"] = df["SeasIndx"].shift(lag)
         
         # Add January 1988 row for prediction
         jan_88_row = {
@@ -115,9 +86,8 @@ class HarmonFoodsForecaster:
             'DA': 500000,
             'DA(t-1)': df['DA'].iloc[-1],
             'DA(t-2)': df['DA(t-1)'].iloc[-1],
-            'SeasIndx': np.nan,  # Will be predicted
+            'SeasIndx': df['SeasIndx'].iloc[-12],  # Use actual value from 12 months ago
             'lag_12': df['SeasIndx'].iloc[-12],
-            'Exceptional Event': 0,
             'Sales': np.nan
         }
         
@@ -130,11 +100,11 @@ class HarmonFoodsForecaster:
     def setup_model_config(self) -> ModelConfig:
         """Setup model configuration"""
         config = ModelConfig(
-            sales_v1_cols=['CP(t-1)', 'DA(t-1)', 'SeasIndx'],
-            sales_v2_cols=['CP', 'DA', 'SeasIndx'],
-            cp_cols=['CP(t-1)'],
-            da_cols=['DA(t-1)'],
-            si_cols=['lag_12']
+            # All variables
+            sales_v1_cols=['CP', 'CP(t-1)', 'CP(t-2)', 'DA', 'DA(t-1)', 'DA(t-2)', 'SeasIndx']
+            
+            # Adjusted model
+            # sales_v1_cols=['CP', 'CP(t-1)', 'DA', 'SeasIndx']
         )
         self.config = config
         return config
@@ -142,14 +112,12 @@ class HarmonFoodsForecaster:
     def initialize_results(self) -> ForecastResults:
         """Initialize results container"""
         results = ForecastResults(
-            sales_pred_v1=[], sales_pred_v2=[], sales_pred_v2_official=[], sales_true=[],
-            cp_pred=[], da_pred=[], si_pred=[],
-            cp_true=[], da_true=[], si_true=[],
-            r2_values={'cp': [], 'da': [], 'si': [], 'sales_v1': [], 'sales_v2': []},
-            adj_r2_values={'cp': [], 'da': [], 'si': [], 'sales_v1': [], 'sales_v2': []},
-            jan88_predictions={'v1': [], 'v2': [], 'v2_official': []},
-            cumulative_rmse={'v1': [], 'v2': []},
-            cumulative_mape={'v1': [], 'v2': []},
+            sales_pred_v1=[], sales_true=[],
+            r2_values={'sales_v1': []},
+            adj_r2_values={'sales_v1': []},
+            jan88_predictions={'v1': []},
+            cumulative_rmse=[],
+            cumulative_mape=[],
             final_model_stats={}
         )
         self.results = results
@@ -201,63 +169,17 @@ class HarmonFoodsForecaster:
         models = {}
         predictions = {}
         
-        # 1. Predict SeasIndx
-        # X_si_train = sm.add_constant(train[self.config.si_cols], has_constant='add')
-        X_si_train = train[self.config.si_cols].copy().astype(float)
-        si_model = sm.OLS(train[self.config.si_target], X_si_train).fit()
-        models['si'] = si_model
-        
-        # X_si_test = sm.add_constant(test[self.config.si_cols], has_constant='add')
-        X_si_test = test[self.config.si_cols].copy().astype(float)
-        si_pred = si_model.predict(X_si_test).iloc[0]
-        predictions['si'] = si_pred
-        
-        # 2. Predict CP (using predicted SI)
-        X_cp_train = sm.add_constant(train[self.config.cp_cols], has_constant='add')
-        cp_model = sm.OLS(train[self.config.cp_target], X_cp_train).fit()
-        models['cp'] = cp_model
-        
-        X_cp_test = sm.add_constant(test[self.config.cp_cols], has_constant='add')
-        # X_cp_test.loc[:, 'SeasIndx'] = si_pred
-        cp_pred = cp_model.predict(X_cp_test).iloc[0]
-        predictions['cp'] = cp_pred
-        
-        # 3. Predict DA
-        X_da_train = sm.add_constant(train[self.config.da_cols], has_constant='add')
-        da_model = sm.OLS(train[self.config.da_target], X_da_train).fit()
-        models['da'] = da_model
-        
-        X_da_test = sm.add_constant(test[self.config.da_cols], has_constant='add')
-        # X_da_test.loc[:, 'Exceptional Event'] = test['Exceptional Event'].values[0]
-        da_pred = da_model.predict(X_da_test).iloc[0]
-        predictions['da'] = da_pred
-        
-        # 4. Sales Model V1 (lag-only)
+        # 1. Sales Model V1 (using actual values)
         X1_train = sm.add_constant(train[self.config.sales_v1_cols], has_constant='add')
         y1_train = train[self.config.sales_target]
         sales_model_v1 = sm.OLS(y1_train, X1_train).fit()
         models['sales_v1'] = sales_model_v1
         
         X1_test = sm.add_constant(test[self.config.sales_v1_cols], has_constant='add')
-        X1_test.loc[:, 'SeasIndx'] = si_pred
         y1_pred = sales_model_v1.predict(X1_test).iloc[0]
         predictions['sales_v1'] = y1_pred
         
-        # 5. Sales Model V2 (full)
-        X2_train = sm.add_constant(train[self.config.sales_v2_cols], has_constant='add')
-        y2_train = train[self.config.sales_target]
-        sales_model_v2 = sm.OLS(y2_train, X2_train).fit()
-        models['sales_v2'] = sales_model_v2
-        
-        X2_test = test[self.config.sales_v2_cols].copy().astype(float)
-        X2_test.loc[:, 'CP'] = cp_pred
-        X2_test.loc[:, 'DA'] = da_pred
-        X2_test.loc[:, 'SeasIndx'] = si_pred
-        X2_test = sm.add_constant(X2_test, has_constant='add')
-        y2_pred = sales_model_v2.predict(X2_test).iloc[0]
-        predictions['sales_v2'] = y2_pred
-        
-        # 6. January 1988 predictions with this iteration's models
+        # 2. January 1988 predictions with this iteration's models
         jan88_predictions = self.predict_jan88(models, jan88_row)
         predictions.update(jan88_predictions)
         
@@ -267,47 +189,12 @@ class HarmonFoodsForecaster:
         """Predict January 1988 values using current models"""
         jan88_row = jan88_row.copy()
         
-        # Predict SeasIndx for Jan 1988
-        # X_si_jan88 = sm.add_constant(jan88_row[self.config.si_cols], has_constant='add')
-        X_si_jan88 = jan88_row[self.config.si_cols].copy().astype(float)
-        si_pred_jan88 = models['si'].predict(X_si_jan88).iloc[0]
-        jan88_row.loc[:, 'SeasIndx'] = si_pred_jan88
-        
-        # Predict CP for Jan 1988
-        X_cp_jan88 = sm.add_constant(jan88_row[self.config.cp_cols], has_constant='add')
-        cp_pred_jan88 = models['cp'].predict(X_cp_jan88).iloc[0]
-        jan88_row.loc[:, 'CP'] = cp_pred_jan88
-        
-        # Predict DA for Jan 1988
-        X_da_jan88 = sm.add_constant(jan88_row[self.config.da_cols], has_constant='add')
-        da_pred_jan88 = models['da'].predict(X_da_jan88).iloc[0]
-        jan88_row.loc[:, 'DA'] = da_pred_jan88
-        
-        # Predict Sales V1 for Jan 1988
+        # Predict Sales V1 for Jan 1988 (using actual SeasIndx value)
         X_sales_v1_jan88 = sm.add_constant(jan88_row[self.config.sales_v1_cols], has_constant='add')
         sales_pred_v1_jan88 = models['sales_v1'].predict(X_sales_v1_jan88).iloc[0]
         
-        # Predict Sales V2 for Jan 1988 (using predicted CP, DA, SI)
-        X_sales_v2_jan88 = jan88_row[self.config.sales_v2_cols].copy()
-        X_sales_v2_jan88['CP'] = cp_pred_jan88
-        X_sales_v2_jan88['DA'] = da_pred_jan88
-        X_sales_v2_jan88['SeasIndx'] = si_pred_jan88
-        X_sales_v2_jan88 = sm.add_constant(X_sales_v2_jan88, has_constant='add')
-        sales_pred_v2_jan88 = models['sales_v2'].predict(X_sales_v2_jan88).iloc[0]
-
-        # Predict Sales V2 for Jan 1988 using official CP, DA (from last available data), and predicted SI
-        X_sales_v2_jan88_official = jan88_row[self.config.sales_v2_cols].copy()
-        X_sales_v2_jan88_official['SeasIndx'] = si_pred_jan88
-        X_sales_v2_jan88_official = sm.add_constant(X_sales_v2_jan88_official, has_constant='add')
-        sales_pred_v2_jan88_official = models['sales_v2'].predict(X_sales_v2_jan88_official).iloc[0]
-        
         return {
-            'jan88_si': si_pred_jan88,
-            'jan88_cp': cp_pred_jan88,
-            'jan88_da': da_pred_jan88,
-            'jan88_sales_v1': sales_pred_v1_jan88,
-            'jan88_sales_v2': sales_pred_v2_jan88,
-            'jan88_sales_v2_official': sales_pred_v2_jan88_official
+            'jan88_sales_v1': sales_pred_v1_jan88
         }
     
     def calculate_cumulative_metrics(self) -> None:
@@ -315,24 +202,19 @@ class HarmonFoodsForecaster:
         if len(self.results.sales_true) > 0:
             sales_true_arr = np.array(self.results.sales_true)
             sales_pred_v1_arr = np.array(self.results.sales_pred_v1)
-            sales_pred_v2_arr = np.array(self.results.sales_pred_v2)
             
             # RMSE
             rmse_v1 = np.sqrt(np.mean((sales_true_arr - sales_pred_v1_arr)**2))
-            rmse_v2 = np.sqrt(np.mean((sales_true_arr - sales_pred_v2_arr)**2))
             
             # MAPE with zero protection
             mask = sales_true_arr != 0
             if np.any(mask):
                 mape_v1 = np.mean(np.abs((sales_true_arr[mask] - sales_pred_v1_arr[mask]) / sales_true_arr[mask])) * 100
-                mape_v2 = np.mean(np.abs((sales_true_arr[mask] - sales_pred_v2_arr[mask]) / sales_true_arr[mask])) * 100
             else:
-                mape_v1 = mape_v2 = 0.0
+                mape_v1 = 0.0
             
-            self.results.cumulative_rmse['v1'].append(rmse_v1)
-            self.results.cumulative_rmse['v2'].append(rmse_v2)
-            self.results.cumulative_mape['v1'].append(mape_v1)
-            self.results.cumulative_mape['v2'].append(mape_v2)
+            self.results.cumulative_rmse.append(rmse_v1)
+            self.results.cumulative_mape.append(mape_v1)
     
     def run_rolling_forecast(self) -> ForecastResults:
         """Main rolling forecast loop"""
@@ -348,34 +230,14 @@ class HarmonFoodsForecaster:
             # Store regular predictions
             test_row = self.df.iloc[t]
             self.results.sales_pred_v1.append(predictions['sales_v1'])
-            self.results.sales_pred_v2.append(predictions['sales_v2'])
-            self.results.sales_pred_v2_official.append(predictions['jan88_sales_v2_official'])
             self.results.sales_true.append(test_row[self.config.sales_target])
             
-            self.results.cp_pred.append(predictions['cp'])
-            self.results.da_pred.append(predictions['da'])
-            self.results.si_pred.append(predictions['si'])
-            self.results.cp_true.append(test_row[self.config.cp_target])
-            self.results.da_true.append(test_row[self.config.da_target])
-            self.results.si_true.append(test_row[self.config.si_target])
-            
             # Store R² and Adjusted R² values
-            self.results.r2_values['cp'].append(models['cp'].rsquared)
-            self.results.r2_values['da'].append(models['da'].rsquared)
-            self.results.r2_values['si'].append(models['si'].rsquared)
             self.results.r2_values['sales_v1'].append(models['sales_v1'].rsquared)
-            self.results.r2_values['sales_v2'].append(models['sales_v2'].rsquared)
-            
-            self.results.adj_r2_values['cp'].append(models['cp'].rsquared_adj)
-            self.results.adj_r2_values['da'].append(models['da'].rsquared_adj)
-            self.results.adj_r2_values['si'].append(models['si'].rsquared_adj)
             self.results.adj_r2_values['sales_v1'].append(models['sales_v1'].rsquared_adj)
-            self.results.adj_r2_values['sales_v2'].append(models['sales_v2'].rsquared_adj)
             
             # Store January 1988 predictions
             self.results.jan88_predictions['v1'].append(predictions['jan88_sales_v1'])
-            self.results.jan88_predictions['v2'].append(predictions['jan88_sales_v2'])
-            self.results.jan88_predictions['v2_official'].append(predictions['jan88_sales_v2_official'])
             
             # Update cumulative metrics
             self.calculate_cumulative_metrics()
@@ -386,45 +248,343 @@ class HarmonFoodsForecaster:
         # Extract detailed statistics from final models
         if final_models:
             self.results.final_model_stats = {
-                'cp': self.extract_model_statistics(final_models['cp'], 'CP Model'),
-                'da': self.extract_model_statistics(final_models['da'], 'DA Model'),
-                'si': self.extract_model_statistics(final_models['si'], 'SeasIndx Model'),
-                'sales_v1': self.extract_model_statistics(final_models['sales_v1'], 'Sales V1 Model'),
-                'sales_v2': self.extract_model_statistics(final_models['sales_v2'], 'Sales V2 Model')
+                'sales_v1': self.extract_model_statistics(final_models['sales_v1'], 'Sales V1 Model')
             }
         
         return self.results
     
+    def calculate_final_model_predictions(self) -> Dict:
+        """Calculate predictions using the final iteration's model on all test data"""
+        if not self.results.final_model_stats:
+            print("No final model available. Run the forecast first.")
+            return {}
+        
+        # Get the final model (from last iteration)
+        final_models = None
+        n = len(self.df) - 1  # Exclude Jan 1988 row
+        
+        # Re-run the last iteration to get the final model
+        t = n - 1  # Last iteration
+        train = self.df.iloc[12:t].copy()
+        
+        # Fit final model
+        X1_train = sm.add_constant(train[self.config.sales_v1_cols], has_constant='add')
+        y1_train = train[self.config.sales_target]
+        final_sales_model = sm.OLS(y1_train, X1_train).fit()
+        
+        # Calculate predictions for all test periods
+        test_predictions = []
+        test_actuals = []
+        test_periods = []
+        
+        for i in range(self.initial_train, n):
+            test_row = self.df.iloc[i:i+1].copy()
+            X_test = sm.add_constant(test_row[self.config.sales_v1_cols], has_constant='add')
+            pred = final_sales_model.predict(X_test).iloc[0]
+            actual = test_row[self.config.sales_target].iloc[0]
+            
+            test_predictions.append(pred)
+            test_actuals.append(actual)
+            test_periods.append(i)
+        
+        # January 1988 prediction
+        jan88_row = self.df.iloc[-1:].copy()
+        X_jan88 = sm.add_constant(jan88_row[self.config.sales_v1_cols], has_constant='add')
+        jan88_pred = final_sales_model.predict(X_jan88).iloc[0]
+        
+        # Calculate final metrics
+        test_predictions_arr = np.array(test_predictions)
+        test_actuals_arr = np.array(test_actuals)
+        
+        final_rmse = np.sqrt(np.mean((test_actuals_arr - test_predictions_arr)**2))
+        mask = test_actuals_arr != 0
+        final_mape = np.mean(np.abs((test_actuals_arr[mask] - test_predictions_arr[mask]) / test_actuals_arr[mask])) * 100 if np.any(mask) else 0.0
+        
+        return {
+            'final_model': final_sales_model,
+            'test_predictions': test_predictions,
+            'test_actuals': test_actuals,
+            'test_periods': test_periods,
+            'jan88_prediction': jan88_pred,
+            'final_rmse': final_rmse,
+            'final_mape': final_mape,
+            'model_summary': str(final_sales_model.summary())
+        }
+    
+    def print_final_model_predictions(self, final_results: Dict) -> None:
+        """Print detailed final model predictions"""
+        print("\n" + "="*80)
+        print("FINAL MODEL PREDICTIONS (Last Iteration)")
+        print("="*80)
+        
+        print(f"\nFinal Model Performance:")
+        print(f"RMSE: {final_results['final_rmse']:,.2f}")
+        print(f"MAPE: {final_results['final_mape']:.2f}%")
+        
+        print(f"\nJanuary 1988 Prediction: {final_results['jan88_prediction']:,.2f}")
+        
+        print(f"\nTest Period Predictions vs Actuals:")
+        print(f"{'Period':<8} {'Actual':<12} {'Predicted':<12} {'Error':<12} {'Error %':<10}")
+        print("-" * 60)
+        
+        for i, (period, actual, pred) in enumerate(zip(final_results['test_periods'], 
+                                                      final_results['test_actuals'], 
+                                                      final_results['test_predictions'])):
+            error = pred - actual
+            error_pct = (error / actual * 100) if actual != 0 else 0
+            print(f"{period:<8} {actual:<12,.0f} {pred:<12,.0f} {error:<12,.0f} {error_pct:<10.2f}%")
+        
+        print(f"\nFinal Model Summary:")
+        print(final_results['model_summary'])
+
+    def calculate_residual_analysis(self, final_results: Dict) -> Dict:
+        """Calculate comprehensive residual analysis"""
+        model = final_results['final_model']
+        test_predictions = np.array(final_results['test_predictions'])
+        test_actuals = np.array(final_results['test_actuals'])
+        
+        # Calculate residuals
+        residuals = test_actuals - test_predictions
+        
+        # Get fitted values from the model (on training data)
+        fitted_values = model.fittedvalues
+        training_residuals = model.resid
+        
+        # Durbin-Watson test
+        dw_statistic = durbin_watson(training_residuals)
+        
+        # Get training data for plotting residuals vs variables
+        n = len(self.df) - 1
+        t = n - 1  # Last iteration
+        train = self.df.iloc[12:t].copy()
+        
+        # Normality test on residuals
+        shapiro_stat, shapiro_p = stats.shapiro(residuals)
+        jarque_bera_stat, jarque_bera_p = stats.jarque_bera(residuals)
+        
+        # Fit normal distribution to residuals
+        mu, sigma = stats.norm.fit(residuals)
+        
+        return {
+            'residuals': residuals,
+            'training_residuals': training_residuals,
+            'fitted_values': fitted_values,
+            'dw_statistic': dw_statistic,
+            'test_periods': final_results['test_periods'],
+            'train_data': train,
+            'shapiro_stat': shapiro_stat,
+            'shapiro_p': shapiro_p,
+            'jarque_bera_stat': jarque_bera_stat,
+            'jarque_bera_p': jarque_bera_p,
+            'normal_mu': mu,
+            'normal_sigma': sigma
+        }
+    
+    def print_residual_statistics(self, residual_results: Dict) -> None:
+        """Print residual analysis statistics"""
+        print("\n" + "="*80)
+        print("RESIDUAL ANALYSIS")
+        print("="*80)
+        
+        residuals = residual_results['residuals']
+        
+        print(f"\nResidual Statistics:")
+        print(f"Mean: {np.mean(residuals):.6f}")
+        print(f"Standard Deviation: {np.std(residuals):.4f}")
+        print(f"Skewness: {stats.skew(residuals):.4f}")
+        print(f"Kurtosis: {stats.kurtosis(residuals):.4f}")
+        print(f"Min: {np.min(residuals):.2f}")
+        print(f"Max: {np.max(residuals):.2f}")
+        
+        print(f"\nDurbin-Watson Statistic: {residual_results['dw_statistic']:.4f}")
+        print("(Values around 2 indicate no autocorrelation)")
+        
+        print(f"\nNormality Tests:")
+        print(f"Shapiro-Wilk Test:")
+        print(f"  Statistic: {residual_results['shapiro_stat']:.4f}")
+        print(f"  P-value: {residual_results['shapiro_p']:.6f}")
+        print(f"  {'Residuals appear normal' if residual_results['shapiro_p'] > 0.05 else 'Residuals may not be normal'}")
+        
+        print(f"\nJarque-Bera Test:")
+        print(f"  Statistic: {residual_results['jarque_bera_stat']:.4f}")
+        print(f"  P-value: {residual_results['jarque_bera_p']:.6f}")
+        print(f"  {'Residuals appear normal' if residual_results['jarque_bera_p'] > 0.05 else 'Residuals may not be normal'}")
+        
+        print(f"\nFitted Normal Distribution:")
+        print(f"  Mean (μ): {residual_results['normal_mu']:.4f}")
+        print(f"  Standard Deviation (σ): {residual_results['normal_sigma']:.4f}")
+
+    def create_residual_plots(self, residual_results: Dict) -> None:
+        """Create comprehensive residual analysis plots"""
+        residuals = residual_results['residuals']
+        test_periods = residual_results['test_periods']
+        fitted_values = residual_results['fitted_values']
+        train_data = residual_results['train_data']
+        
+        # Create figure with 4 subplots (2x2)
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Residual Analysis - Final Model', fontsize=16, fontweight='bold')
+        
+        # Plot 1: Residuals over time
+        ax1 = axes[0, 0]
+        ax1.plot(test_periods, residuals, 'o-', color='blue', alpha=0.7)
+        ax1.axhline(y=0, color='red', linestyle='--', alpha=0.8)
+        ax1.set_title('Residuals Over Time')
+        ax1.set_xlabel('Time Period')
+        ax1.set_ylabel('Residuals')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Residuals vs Fitted Values
+        ax2 = axes[0, 1]
+        # Get actual fitted values by re-predicting
+        final_model = None
+        n = len(self.df) - 1
+        t = n - 1
+        train = self.df.iloc[12:t].copy()
+        X1_train = sm.add_constant(train[self.config.sales_v1_cols], has_constant='add')
+        y1_train = train[self.config.sales_target]
+        final_sales_model = sm.OLS(y1_train, X1_train).fit()
+        
+        test_fitted_actual = []
+        for i in range(len(test_periods)):
+            period = test_periods[i]
+            test_row = self.df.iloc[period:period+1].copy()
+            X_test = sm.add_constant(test_row[self.config.sales_v1_cols], has_constant='add')
+            fitted_val = final_sales_model.predict(X_test).iloc[0]
+            test_fitted_actual.append(fitted_val)
+        
+        ax2.scatter(test_fitted_actual, residuals, alpha=0.7, color='green')
+        ax2.axhline(y=0, color='red', linestyle='--', alpha=0.8)
+        ax2.set_title('Residuals vs Fitted Values')
+        ax2.set_xlabel('Fitted Values')
+        ax2.set_ylabel('Residuals')
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot 3: Histogram of residuals with normal distribution
+        ax3 = axes[1, 0]
+        n_bins = max(8, len(residuals) // 3)
+        n_hist, bins, patches = ax3.hist(residuals, bins=n_bins, density=True, alpha=0.7, color='skyblue', edgecolor='black')
+        
+        # Fit and plot normal distribution
+        mu = residual_results['normal_mu']
+        sigma = residual_results['normal_sigma']
+        x = np.linspace(residuals.min(), residuals.max(), 100)
+        normal_curve = stats.norm.pdf(x, mu, sigma)
+        ax3.plot(x, normal_curve, 'r-', linewidth=2, label=f'Normal(μ={mu:.2f}, σ={sigma:.2f})')
+        ax3.set_title('Residuals Histogram with Normal Fit')
+        ax3.set_xlabel('Residuals')
+        ax3.set_ylabel('Density')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # Plot 4: Autocorrelation of residuals
+        ax4 = axes[1, 1]
+        if len(residuals) > 1:
+            # Calculate autocorrelation manually for lag 1
+            residuals_lag1 = residuals[1:]
+            residuals_current = residuals[:-1]
+            ax4.scatter(residuals_current, residuals_lag1, alpha=0.7, color='purple')
+            ax4.axhline(y=0, color='red', linestyle='--', alpha=0.8)
+            ax4.axvline(x=0, color='red', linestyle='--', alpha=0.8)
+            ax4.set_title('Residuals Autocorrelation (Lag 1)')
+            ax4.set_xlabel('Residuals (t)')
+            ax4.set_ylabel('Residuals (t+1)')
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('outputs/residual_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"\nResidual analysis plots saved as 'outputs/residual_analysis.png'")
+
+    def save_results_to_txt(self, final_model_results: Dict, residual_results: Dict) -> None:
+        """Save comprehensive results to a text file"""
+        import datetime
+        
+        with open('outputs/forecasting_results.txt', 'w') as f:
+            # Header
+            f.write("="*80 + "\n")
+            f.write("HARMON FOODS FORECASTING ANALYSIS RESULTS\n")
+            f.write("="*80 + "\n")
+            f.write(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\n")
+            
+            # Final Model Performance
+            f.write("FINAL MODEL PREDICTIONS (Last Iteration)\n")
+            f.write("="*80 + "\n")
+            f.write(f"Final Model Performance:\n")
+            f.write(f"RMSE: {final_model_results['final_rmse']:,.2f}\n")
+            f.write(f"MAPE: {final_model_results['final_mape']:.2f}%\n")
+            f.write(f"\nJanuary 1988 Prediction: {final_model_results['jan88_prediction']:,.2f}\n")
+            f.write("\n")
+            
+            # Test Period Predictions
+            f.write("Test Period Predictions vs Actuals:\n")
+            f.write(f"{'Period':<8} {'Actual':<12} {'Predicted':<12} {'Error':<12} {'Error %':<10}\n")
+            f.write("-" * 60 + "\n")
+            
+            for i, (period, actual, pred) in enumerate(zip(final_model_results['test_periods'], 
+                                                          final_model_results['test_actuals'], 
+                                                          final_model_results['test_predictions'])):
+                error = pred - actual
+                error_pct = (error / actual * 100) if actual != 0 else 0
+                f.write(f"{period:<8} {actual:<12,.0f} {pred:<12,.0f} {error:<12,.0f} {error_pct:<10.2f}%\n")
+            
+            f.write("\n\n")
+            
+            # Residual Analysis
+            f.write("RESIDUAL ANALYSIS\n")
+            f.write("="*80 + "\n")
+            
+            residuals = residual_results['residuals']
+            
+            f.write(f"Residual Statistics:\n")
+            f.write(f"Mean: {np.mean(residuals):.6f}\n")
+            f.write(f"Standard Deviation: {np.std(residuals):.4f}\n")
+            f.write(f"Skewness: {stats.skew(residuals):.4f}\n")
+            f.write(f"Kurtosis: {stats.kurtosis(residuals):.4f}\n")
+            f.write(f"Min: {np.min(residuals):.2f}\n")
+            f.write(f"Max: {np.max(residuals):.2f}\n")
+            f.write("\n")
+            
+            f.write(f"Durbin-Watson Statistic: {residual_results['dw_statistic']:.4f}\n")
+            f.write("(Values around 2 indicate no autocorrelation)\n")
+            f.write("\n")
+            
+            f.write(f"Normality Tests:\n")
+            f.write(f"Shapiro-Wilk Test:\n")
+            f.write(f"  Statistic: {residual_results['shapiro_stat']:.4f}\n")
+            f.write(f"  P-value: {residual_results['shapiro_p']:.6f}\n")
+            f.write(f"  {'Residuals appear normal' if residual_results['shapiro_p'] > 0.05 else 'Residuals may not be normal'}\n")
+            f.write("\n")
+            
+            f.write(f"Jarque-Bera Test:\n")
+            f.write(f"  Statistic: {residual_results['jarque_bera_stat']:.4f}\n")
+            f.write(f"  P-value: {residual_results['jarque_bera_p']:.6f}\n")
+            f.write(f"  {'Residuals appear normal' if residual_results['jarque_bera_p'] > 0.05 else 'Residuals may not be normal'}\n")
+            f.write("\n")
+            
+            f.write(f"Fitted Normal Distribution:\n")
+            f.write(f"  Mean (μ): {residual_results['normal_mu']:.4f}\n")
+            f.write(f"  Standard Deviation (σ): {residual_results['normal_sigma']:.4f}\n")
+            f.write("\n\n")
+            
+            # Model Summary
+            f.write("FINAL MODEL SUMMARY\n")
+            f.write("="*80 + "\n")
+            f.write(final_model_results['model_summary'])
+            f.write("\n")
+        
+        print(f"\nComplete results saved to 'outputs/forecasting_results.txt'")
+
     def calculate_ensemble_predictions(self) -> Dict[str, float]:
         """Calculate ensemble predictions for January 1988"""
         jan88_v1 = np.array(self.results.jan88_predictions['v1'])
-        jan88_v2 = np.array(self.results.jan88_predictions['v2'])
-        jan88_v2_official = np.array(self.results.jan88_predictions['v2_official'])
-        rmse_v1 = np.array(self.results.cumulative_rmse['v1'])
-        rmse_v2 = np.array(self.results.cumulative_rmse['v2'])
         
-        # Simple mean ensemble
-        simple_mean_v1 = np.mean(jan88_v1)
-        simple_mean_v2 = np.mean(jan88_v2)
-        simple_mean_v2_official = np.mean(jan88_v2_official)
-        
-        # Weighted mean ensemble (inverse RMSE)
-        # Weighted ensemble for each model separately (inverse RMSE)
-        
-        # For V1
-        weights_v1 = 1 / rmse_v1
-        weighted_ensemble_v1 = np.sum(weights_v1 * jan88_v1) / np.sum(weights_v1)
-        
-        # For V2
-        weights_v2 = 1 / rmse_v2
-        weighted_ensemble_v2 = np.sum(weights_v2 * jan88_v2) / np.sum(weights_v2)
+        # Get the final prediction (last iteration)
+        final_prediction = jan88_v1[-1] if len(jan88_v1) > 0 else 0.0
         
         return {
-            'simple_mean_v1': simple_mean_v1,
-            'simple_mean_v2': simple_mean_v2,
-            'simple_mean_v2_official': simple_mean_v2_official,
-            'weighted_ensemble_v1': weighted_ensemble_v1,
-            'weighted_ensemble_v2': weighted_ensemble_v2,
+            'final_prediction': final_prediction,
         }
     
     def print_coefficient_stats(self, model_stats: Dict, model_name: str) -> None:
@@ -451,81 +611,18 @@ class HarmonFoodsForecaster:
     
     def print_results(self, ensemble_results: Dict) -> None:
         """Print comprehensive results"""
-        print("\n" + "="*50)
-        print("HARMON FOODS FORECASTING RESULTS")
-        print("="*50)
-        
-        # Convert to arrays for calculations
-        sales_true = np.array(self.results.sales_true)
-        sales_pred_v1 = np.array(self.results.sales_pred_v1)
-        sales_pred_v2 = np.array(self.results.sales_pred_v2)
-        sales_pred_v2_official = np.array(self.results.sales_pred_v2_official)
-        
-        # Calculate final metrics
-        rmse_v1 = np.sqrt(np.mean((sales_true - sales_pred_v1)**2))
-        rmse_v2 = np.sqrt(np.mean((sales_true - sales_pred_v2)**2))
-        rmse_v2_official = np.sqrt(np.mean((sales_true - sales_pred_v2_official)**2))
-
-        def mape(y_true, y_pred):
-            mask = y_true != 0
-            return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if np.any(mask) else 0.0
-        
-        mape_v1 = mape(sales_true, sales_pred_v1)
-        mape_v2 = mape(sales_true, sales_pred_v2)
-        mape_v2_official = mape(sales_true, sales_pred_v2_official)
-
-        print(f"\nSales Model Performance:")
-        print(f"Model V1 (Lag-only)  - RMSE: {rmse_v1:,.2f}, MAPE: {mape_v1:.2f}%")
-        print(f"Model V2 (Full)      - RMSE: {rmse_v2:,.2f}, MAPE: {mape_v2:.2f}%")
-        print(f"Model V2 (Official)  - RMSE: {rmse_v2_official:,.2f}, MAPE: {mape_v2_official:.2f}%")
-
-        # Print R² and Adjusted R² statistics
-        print(f"\n{'='*60}")
-        print("R² AND ADJUSTED R² STATISTICS ACROSS ITERATIONS")
-        print(f"{'='*60}")
-        
-        for model_name in ['cp', 'da', 'si', 'sales_v1', 'sales_v2']:
-            r2_values = np.array(self.results.r2_values[model_name])
-            adj_r2_values = np.array(self.results.adj_r2_values[model_name])
-            
-            print(f"\n{model_name.upper()} Model:")
-            print(f"  R² - Mean: {np.mean(r2_values):.4f}, Std: {np.std(r2_values):.4f}, "
-                  f"Min: {np.min(r2_values):.4f}, Max: {np.max(r2_values):.4f}")
-            print(f"  Adj R² - Mean: {np.mean(adj_r2_values):.4f}, Std: {np.std(adj_r2_values):.4f}, "
-                  f"Min: {np.min(adj_r2_values):.4f}, Max: {np.max(adj_r2_values):.4f}")
-        
-        print(f"\nJanuary 1988 Ensemble Predictions:")
-        print(f"Simple Mean V1:      {ensemble_results['simple_mean_v1']:,.2f}")
-        print(f"Simple Mean V2:      {ensemble_results['simple_mean_v2']:,.2f}")
-        print(f"Simple Mean V2 Official: {ensemble_results['simple_mean_v2_official']:,.2f}")
-        
-        print(f"\nEnsemble Weights (Inverse RMSE):")
-        print(f"V1 Weighted Ensemble: {ensemble_results['weighted_ensemble_v1']:,.2f}")
-        print(f"V2 Weighted Ensemble: {ensemble_results['weighted_ensemble_v2']:,.2f}")
-        
-        # Print detailed coefficient statistics for final models
-        if self.results.final_model_stats:
-            print(f"\n{'='*80}")
-            print("FINAL MODEL DETAILED STATISTICS (Last Iteration)")
-            print(f"{'='*80}")
-            
-            for model_key, model_stats in self.results.final_model_stats.items():
-                self.print_coefficient_stats(model_stats, model_stats['model_name'])
+        pass  # Results printing removed as requested
     
     def create_visualizations(self, ensemble_results: Dict) -> None:
         """Create comprehensive visualizations"""
-        # Create two separate figure sets
-        
-        # Figure 1: Main Analysis
-        fig1, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-        fig1.suptitle('Harmon Foods Forecasting Analysis', fontsize=16, fontweight='bold')
+        # Create simplified figure with 2x2 layout
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Harmon Foods Forecasting Analysis - Simplified', fontsize=16, fontweight='bold')
         
         iterations = list(range(len(self.results.jan88_predictions['v1'])))
         
-        # Plot 1: January 1988 Predictions Evolution
+        # Plot 1: January 1988 Sales Predictions Evolution
         ax1.plot(iterations, self.results.jan88_predictions['v1'], 'purple', linewidth=2, label='Model V1', marker='o', markersize=3)
-        ax1.plot(iterations, self.results.jan88_predictions['v2'], 'orange', linewidth=2, label='Model V2', marker='s', markersize=3)
-        ax1.plot(iterations, self.results.jan88_predictions['v2_official'], 'orange', linewidth=2, label='Model V2 official', marker='x', markersize=3)
         ax1.set_title('January 1988 Sales Predictions Evolution')
         ax1.set_xlabel('Iteration')
         ax1.set_ylabel('Predicted Sales')
@@ -533,128 +630,37 @@ class HarmonFoodsForecaster:
         ax1.grid(True, alpha=0.3)
         
         # Plot 2: Cumulative RMSE Evolution
-        ax2.plot(iterations, self.results.cumulative_rmse['v1'], 'purple', linewidth=2, label='Model V1', marker='o', markersize=3)
-        ax2.plot(iterations, self.results.cumulative_rmse['v2'], 'orange', linewidth=2, label='Model V2', marker='s', markersize=3)
+        ax2.plot(iterations, self.results.cumulative_rmse, 'purple', linewidth=2, label='Model V1', marker='o', markersize=3)
         ax2.set_title('Cumulative RMSE Evolution')
         ax2.set_xlabel('Iteration')
         ax2.set_ylabel('Cumulative RMSE')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
-        # Plot 3: R² Evolution for Sales Models
+        # Plot 3: R² Evolution for Sales Model
         ax3.plot(iterations, self.results.r2_values['sales_v1'], 'purple', linewidth=2, label='Sales V1 R²', marker='o', markersize=3)
-        ax3.plot(iterations, self.results.r2_values['sales_v2'], 'orange', linewidth=2, label='Sales V2 R²', marker='s', markersize=3)
         ax3.plot(iterations, self.results.adj_r2_values['sales_v1'], 'purple', linewidth=2, label='Sales V1 Adj R²', marker='d', markersize=3, alpha=0.7, linestyle='--')
-        ax3.plot(iterations, self.results.adj_r2_values['sales_v2'], 'orange', linewidth=2, label='Sales V2 Adj R²', marker='^', markersize=3, alpha=0.7, linestyle='--')
-        ax3.set_title('R² and Adjusted R² Evolution - Sales Models')
+        ax3.set_title('R² and Adjusted R² Evolution - Sales Model')
         ax3.set_xlabel('Iteration')
         ax3.set_ylabel('R² / Adjusted R²')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         
-        # Plot 4: Ensemble Weights Evolution
-        weights_v1 = []
-        weights_v2 = []
-        
-        for i in range(len(self.results.cumulative_rmse['v1'])):
-            rmse_v1 = self.results.cumulative_rmse['v1'][i] if self.results.cumulative_rmse['v1'][i] > 0 else 1e-8
-            rmse_v2 = self.results.cumulative_rmse['v2'][i] if self.results.cumulative_rmse['v2'][i] > 0 else 1e-8
-            
-            w1 = (1/rmse_v1) / ((1/rmse_v1) + (1/rmse_v2))
-            w2 = (1/rmse_v2) / ((1/rmse_v1) + (1/rmse_v2))
-            
-            weights_v1.append(w1)
-            weights_v2.append(w2)
-        
-        ax4.plot(iterations, weights_v1, 'purple', linewidth=2, label='V1 Weight', marker='o', markersize=3)
-        ax4.plot(iterations, weights_v2, 'orange', linewidth=2, label='V2 Weight', marker='s', markersize=3)
-        ax4.set_title('Ensemble Weights Evolution')
-        ax4.set_xlabel('Iteration')
-        ax4.set_ylabel('Weight')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
-        ax4.set_ylim(0, 1)
-        
-        plt.tight_layout()
-        plt.savefig('outputs/harmon_foods_analysis.png', dpi=300, bbox_inches='tight')
-        print(f"\nMain analysis visualization saved as 'outputs/harmon_foods_analysis.png'")
-        plt.show()
-        
-        # Figure 2: Model Performance Analysis
-        fig2, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-        fig2.suptitle('Model Performance Analysis - R² Statistics', fontsize=16, fontweight='bold')
-        
-        # Plot 1: R² Evolution for All Models
-        ax1.plot(iterations, self.results.r2_values['cp'], 'blue', linewidth=2, label='CP Model', marker='o', markersize=2)
-        ax1.plot(iterations, self.results.r2_values['da'], 'red', linewidth=2, label='DA Model', marker='s', markersize=2)
-        ax1.plot(iterations, self.results.r2_values['si'], 'green', linewidth=2, label='SI Model', marker='^', markersize=2)
-        ax1.set_title('R² Evolution - Predictor Models')
-        ax1.set_xlabel('Iteration')
-        ax1.set_ylabel('R²')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Adjusted R² Evolution for All Models
-        ax2.plot(iterations, self.results.adj_r2_values['cp'], 'blue', linewidth=2, label='CP Model', marker='o', markersize=2)
-        ax2.plot(iterations, self.results.adj_r2_values['da'], 'red', linewidth=2, label='DA Model', marker='s', markersize=2)
-        ax2.plot(iterations, self.results.adj_r2_values['si'], 'green', linewidth=2, label='SI Model', marker='^', markersize=2)
-        ax2.set_title('Adjusted R² Evolution - Predictor Models')
-        ax2.set_xlabel('Iteration')
-        ax2.set_ylabel('Adjusted R²')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # Plot 3: R² vs Adjusted R² Comparison (Final Values)
-        models = ['CP', 'DA', 'SI', 'Sales V1', 'Sales V2']
-        final_r2 = [
-            self.results.r2_values['cp'][-1],
-            self.results.r2_values['da'][-1],
-            self.results.r2_values['si'][-1],
-            self.results.r2_values['sales_v1'][-1],
-            self.results.r2_values['sales_v2'][-1]
-        ]
-        final_adj_r2 = [
-            self.results.adj_r2_values['cp'][-1],
-            self.results.adj_r2_values['da'][-1],
-            self.results.adj_r2_values['si'][-1],
-            self.results.adj_r2_values['sales_v1'][-1],
-            self.results.adj_r2_values['sales_v2'][-1]
-        ]
-        
-        x = np.arange(len(models))
-        width = 0.35
-        
-        ax3.bar(x - width/2, final_r2, width, label='R²', alpha=0.7, color='skyblue')
-        ax3.bar(x + width/2, final_adj_r2, width, label='Adjusted R²', alpha=0.7, color='lightcoral')
-        ax3.set_title('Final R² vs Adjusted R² Comparison')
-        ax3.set_ylabel('R² Value')
-        ax3.set_xticks(x)
-        ax3.set_xticklabels(models, rotation=45)
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        
-        # Plot 4: Model Fit Quality Distribution
-        all_r2_values = []
-        all_adj_r2_values = []
-        model_labels = []
-        
-        for model_name in ['cp', 'da', 'si', 'sales_v1', 'sales_v2']:
-            all_r2_values.extend(self.results.r2_values[model_name])
-            all_adj_r2_values.extend(self.results.adj_r2_values[model_name])
-            model_labels.extend([model_name.upper()] * len(self.results.r2_values[model_name]))
-        
-        ax4.scatter(all_r2_values, all_adj_r2_values, c=range(len(all_r2_values)), cmap='viridis', alpha=0.6)
-        ax4.plot([0, 1], [0, 1], 'r--', alpha=0.5, label='R² = Adj R²')
-        ax4.set_xlabel('R²')
-        ax4.set_ylabel('Adjusted R²')
-        ax4.set_title('R² vs Adjusted R² Scatter Plot')
+        # Plot 4: Sales Predictions vs Actuals
+        ax4.scatter(self.results.sales_true, self.results.sales_pred_v1, alpha=0.6, color='purple')
+        min_val = min(min(self.results.sales_true), min(self.results.sales_pred_v1))
+        max_val = max(max(self.results.sales_true), max(self.results.sales_pred_v1))
+        ax4.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
+        ax4.set_title('Sales Predictions vs Actuals')
+        ax4.set_xlabel('Actual Sales')
+        ax4.set_ylabel('Predicted Sales')
         ax4.legend()
         ax4.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('outputs/model_performance_analysis.png', dpi=300, bbox_inches='tight')
-        print(f"Model performance visualization saved as 'outputs/model_performance_analysis.png'")
-        plt.show()
+        plt.savefig('outputs/harmon_foods_analysis_simplified.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"\nSimplified analysis visualization saved as 'outputs/harmon_foods_analysis_simplified.png'")
 
 def main():
     """Main execution function"""
@@ -676,6 +682,18 @@ def main():
     
     # Calculate ensemble predictions
     ensemble_results = forecaster.calculate_ensemble_predictions()
+    
+    # Calculate and print final model predictions
+    final_model_results = forecaster.calculate_final_model_predictions()
+    forecaster.print_final_model_predictions(final_model_results)
+    
+    # Perform residual analysis
+    residual_results = forecaster.calculate_residual_analysis(final_model_results)
+    forecaster.print_residual_statistics(residual_results)
+    forecaster.create_residual_plots(residual_results)
+    
+    # Save results to text file
+    forecaster.save_results_to_txt(final_model_results, residual_results)
     
     # Print results
     forecaster.print_results(ensemble_results)

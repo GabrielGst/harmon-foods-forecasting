@@ -1,0 +1,100 @@
+================================================================================
+HARMON FOODS FORECASTING ANALYSIS RESULTS
+================================================================================
+Generated on: 2025-10-01 18:36:54
+
+FINAL MODEL PREDICTIONS (Last Iteration)
+================================================================================
+Final Model Performance:
+RMSE: 31,223.38
+MAPE: 7.00%
+
+January 1988 Prediction: 460,812.84
+
+Test Period Predictions vs Actuals:
+Period   Actual       Predicted    Error        Error %   
+------------------------------------------------------------
+24       365,058      379,256      14,198       3.89      %
+25       313,135      361,512      48,377       15.45     %
+26       528,210      459,851      -68,359      -12.94    %
+27       379,856      395,473      15,617       4.11      %
+28       472,058      429,577      -42,481      -9.00     %
+29       254,516      266,688      12,172       4.78      %
+30       551,354      502,932      -48,422      -8.78     %
+31       335,826      299,265      -36,561      -10.89    %
+32       320,408      316,831      -3,577       -1.12     %
+33       276,901      243,260      -33,641      -12.15    %
+34       455,136      484,045      28,909       6.35      %
+35       247,570      259,525      11,955       4.83      %
+36       429,331      444,155      14,824       3.45      %
+37       451,779      454,470      2,691        0.60      %
+38       249,482      226,776      -22,706      -9.10     %
+39       421,186      398,849      -22,337      -5.30     %
+40       397,367      392,820      -4,547       -1.14     %
+41       269,096      236,386      -32,710      -12.16    %
+
+
+RESIDUAL ANALYSIS
+================================================================================
+Residual Statistics:
+Mean: 9255.517137
+Standard Deviation: 29820.0369
+Skewness: 0.0943
+Kurtosis: -0.7757
+Min: -48376.51
+Max: 68358.64
+
+Durbin-Watson Statistic: 2.2614
+(Values around 2 indicate no autocorrelation)
+
+Normality Tests:
+Shapiro-Wilk Test:
+  Statistic: 0.9694
+  P-value: 0.786404
+  Residuals appear normal
+
+Jarque-Bera Test:
+  Statistic: 0.4780
+  P-value: 0.787404
+  Residuals appear normal
+
+Fitted Normal Distribution:
+  Mean (μ): 9255.5171
+  Standard Deviation (σ): 29820.0369
+
+
+FINAL MODEL SUMMARY
+================================================================================
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:                  Sales   R-squared:                       0.912
+Model:                            OLS   Adj. R-squared:                  0.882
+Method:                 Least Squares   F-statistic:                     31.03
+Date:                Wed, 01 Oct 2025   Prob (F-statistic):           1.08e-09
+Time:                        18:36:51   Log-Likelihood:                -337.38
+No. Observations:                  29   AIC:                             690.8
+Df Residuals:                      21   BIC:                             701.7
+Df Model:                           7                                         
+Covariance Type:            nonrobust                                         
+==============================================================================
+                 coef    std err          t      P>|t|      [0.025      0.975]
+------------------------------------------------------------------------------
+const       -8.18e+04   4.85e+04     -1.688      0.106   -1.83e+05     1.9e+04
+CP             0.4583      0.079      5.766      0.000       0.293       0.624
+CP(t-1)       -0.1858      0.040     -4.642      0.000      -0.269      -0.103
+CP(t-2)       -0.0121      0.041     -0.293      0.773      -0.098       0.074
+DA             0.1343      0.043      3.134      0.005       0.045       0.223
+DA(t-1)        0.0068      0.006      1.180      0.251      -0.005       0.019
+DA(t-2)       -0.0111      0.008     -1.374      0.184      -0.028       0.006
+SeasIndx    3949.2449    525.051      7.522      0.000    2857.341    5041.149
+==============================================================================
+Omnibus:                        1.674   Durbin-Watson:                   2.261
+Prob(Omnibus):                  0.433   Jarque-Bera (JB):                1.029
+Skew:                           0.461   Prob(JB):                        0.598
+Kurtosis:                       3.038   Cond. No.                     1.07e+07
+==============================================================================
+
+Notes:
+[1] Standard Errors assume that the covariance matrix of the errors is correctly specified.
+[2] The condition number is large, 1.07e+07. This might indicate that there are
+strong multicollinearity or other numerical problems.
